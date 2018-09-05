@@ -20,16 +20,20 @@ import (
 	"fmt"
 	"testing"
 
+	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/record"
-	kubeapi "k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/v1"
+	kubeapi "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/apis/scheduling"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 )
 
 const (
 	critical              = "critical"
+	clusterCritical       = "cluster-critical"
+	nodeCritical          = "node-critical"
 	bestEffort            = "bestEffort"
 	burstable             = "burstable"
 	highRequestBurstable  = "high-request-burstable"
@@ -85,6 +89,9 @@ func getTestCriticalPodAdmissionHandler(podProvider *fakePodProvider, podKiller 
 }
 
 func TestEvictPodsToFreeRequests(t *testing.T) {
+	if err := utilfeature.DefaultFeatureGate.Set("ExperimentalCriticalPodAnnotation=true"); err != nil {
+		t.Errorf("failed to set ExperimentalCriticalPodAnnotation to true: %v", err)
+	}
 	type testRun struct {
 		testName              string
 		inputPods             []*v1.Pod
@@ -123,7 +130,7 @@ func TestEvictPodsToFreeRequests(t *testing.T) {
 	}
 	for _, r := range runs {
 		podProvider.setPods(r.inputPods)
-		outErr := criticalPodAdmissionHandler.evictPodsToFreeRequests(r.insufficientResources)
+		outErr := criticalPodAdmissionHandler.evictPodsToFreeRequests(nil, r.insufficientResources)
 		outputPods := podKiller.getKilledPods()
 		if !r.expectErr && outErr != nil {
 			t.Errorf("evictPodsToFreeRequests returned an unexpected error during the %s test.  Err: %v", r.testName, outErr)
@@ -143,7 +150,7 @@ func BenchmarkGetPodsToPreempt(t *testing.B) {
 		inputPods = append(inputPods, allPods[tinyBurstable])
 	}
 	for n := 0; n < t.N; n++ {
-		getPodsToPreempt(inputPods, admissionRequirementList([]*admissionRequirement{
+		getPodsToPreempt(nil, inputPods, admissionRequirementList([]*admissionRequirement{
 			{
 				resourceName: v1.ResourceCPU,
 				quantity:     parseCPUToInt64("110m"),
@@ -154,6 +161,7 @@ func BenchmarkGetPodsToPreempt(t *testing.B) {
 func TestGetPodsToPreempt(t *testing.T) {
 	type testRun struct {
 		testName              string
+		preemptor             *v1.Pod
 		inputPods             []*v1.Pod
 		insufficientResources admissionRequirementList
 		expectErr             bool
@@ -183,7 +191,7 @@ func TestGetPodsToPreempt(t *testing.T) {
 			expectedOutput:        []*v1.Pod{allPods[burstable]},
 		},
 		{
-			testName:              "higer requirements than pod requests",
+			testName:              "higher requirements than pod requests",
 			inputPods:             []*v1.Pod{allPods[burstable]},
 			insufficientResources: getAdmissionRequirementList(200, 200, 2),
 			expectErr:             true,
@@ -231,9 +239,26 @@ func TestGetPodsToPreempt(t *testing.T) {
 			expectErr:             false,
 			expectedOutput:        []*v1.Pod{allPods[highRequestBurstable], allPods[highRequestGuaranteed]},
 		},
+		{
+			testName:              "evict cluster critical pod for node critical pod",
+			preemptor:             allPods[nodeCritical],
+			inputPods:             []*v1.Pod{allPods[clusterCritical]},
+			insufficientResources: getAdmissionRequirementList(100, 0, 0),
+			expectErr:             false,
+			expectedOutput:        []*v1.Pod{allPods[clusterCritical]},
+		},
+		{
+			testName:              "can not evict node critical pod for cluster critical pod",
+			preemptor:             allPods[clusterCritical],
+			inputPods:             []*v1.Pod{allPods[nodeCritical]},
+			insufficientResources: getAdmissionRequirementList(100, 0, 0),
+			expectErr:             true,
+			expectedOutput:        nil,
+		},
 	}
+
 	for _, r := range runs {
-		outputPods, outErr := getPodsToPreempt(r.inputPods, r.insufficientResources)
+		outputPods, outErr := getPodsToPreempt(r.preemptor, r.inputPods, r.insufficientResources)
 		if !r.expectErr && outErr != nil {
 			t.Errorf("getPodsToPreempt returned an unexpected error during the %s test.  Err: %v", r.testName, outErr)
 		} else if r.expectErr && outErr == nil {
@@ -338,52 +363,75 @@ func getTestPods() map[string]*v1.Pod {
 	allPods := map[string]*v1.Pod{
 		tinyBurstable: getPodWithResources(tinyBurstable, v1.ResourceRequirements{
 			Requests: v1.ResourceList{
-				"cpu":    resource.MustParse("1m"),
-				"memory": resource.MustParse("1Mi"),
+				v1.ResourceCPU:    resource.MustParse("1m"),
+				v1.ResourceMemory: resource.MustParse("1Mi"),
 			},
 		}),
 		bestEffort: getPodWithResources(bestEffort, v1.ResourceRequirements{}),
 		critical: getPodWithResources(critical, v1.ResourceRequirements{
 			Requests: v1.ResourceList{
-				"cpu":    resource.MustParse("100m"),
-				"memory": resource.MustParse("100Mi"),
+				v1.ResourceCPU:    resource.MustParse("100m"),
+				v1.ResourceMemory: resource.MustParse("100Mi"),
+			},
+		}),
+		clusterCritical: getPodWithResources(clusterCritical, v1.ResourceRequirements{
+			Requests: v1.ResourceList{
+				v1.ResourceCPU:    resource.MustParse("100m"),
+				v1.ResourceMemory: resource.MustParse("100Mi"),
+			},
+		}),
+		nodeCritical: getPodWithResources(nodeCritical, v1.ResourceRequirements{
+			Requests: v1.ResourceList{
+				v1.ResourceCPU:    resource.MustParse("100m"),
+				v1.ResourceMemory: resource.MustParse("100Mi"),
 			},
 		}),
 		burstable: getPodWithResources(burstable, v1.ResourceRequirements{
 			Requests: v1.ResourceList{
-				"cpu":    resource.MustParse("100m"),
-				"memory": resource.MustParse("100Mi"),
+				v1.ResourceCPU:    resource.MustParse("100m"),
+				v1.ResourceMemory: resource.MustParse("100Mi"),
 			},
 		}),
 		guaranteed: getPodWithResources(guaranteed, v1.ResourceRequirements{
 			Requests: v1.ResourceList{
-				"cpu":    resource.MustParse("100m"),
-				"memory": resource.MustParse("100Mi"),
+				v1.ResourceCPU:    resource.MustParse("100m"),
+				v1.ResourceMemory: resource.MustParse("100Mi"),
 			},
 			Limits: v1.ResourceList{
-				"cpu":    resource.MustParse("100m"),
-				"memory": resource.MustParse("100Mi"),
+				v1.ResourceCPU:    resource.MustParse("100m"),
+				v1.ResourceMemory: resource.MustParse("100Mi"),
 			},
 		}),
 		highRequestBurstable: getPodWithResources(highRequestBurstable, v1.ResourceRequirements{
 			Requests: v1.ResourceList{
-				"cpu":    resource.MustParse("300m"),
-				"memory": resource.MustParse("300Mi"),
+				v1.ResourceCPU:    resource.MustParse("300m"),
+				v1.ResourceMemory: resource.MustParse("300Mi"),
 			},
 		}),
 		highRequestGuaranteed: getPodWithResources(highRequestGuaranteed, v1.ResourceRequirements{
 			Requests: v1.ResourceList{
-				"cpu":    resource.MustParse("300m"),
-				"memory": resource.MustParse("300Mi"),
+				v1.ResourceCPU:    resource.MustParse("300m"),
+				v1.ResourceMemory: resource.MustParse("300Mi"),
 			},
 			Limits: v1.ResourceList{
-				"cpu":    resource.MustParse("300m"),
-				"memory": resource.MustParse("300Mi"),
+				v1.ResourceCPU:    resource.MustParse("300m"),
+				v1.ResourceMemory: resource.MustParse("300Mi"),
 			},
 		}),
 	}
 	allPods[critical].Namespace = kubeapi.NamespaceSystem
 	allPods[critical].Annotations[kubetypes.CriticalPodAnnotationKey] = ""
+
+	allPods[clusterCritical].Namespace = kubeapi.NamespaceSystem
+	allPods[clusterCritical].Spec.PriorityClassName = scheduling.SystemClusterCritical
+	clusterPriority := scheduling.SystemCriticalPriority
+	allPods[clusterCritical].Spec.Priority = &clusterPriority
+
+	allPods[nodeCritical].Namespace = kubeapi.NamespaceSystem
+	allPods[nodeCritical].Spec.PriorityClassName = scheduling.SystemNodeCritical
+	nodePriority := scheduling.SystemCriticalPriority + 100
+	allPods[nodeCritical].Spec.Priority = &nodePriority
+
 	return allPods
 }
 
@@ -458,21 +506,21 @@ func admissionRequirementListEqual(list1 admissionRequirementList, list2 admissi
 	return true
 }
 
-// this checks if the lists contents contain all of the same elements.
-// this is not correct if there are duplicate pods in the list.
-// for example: podListEqual([a, a, b], [a, b, b]) will return true
+// podListEqual checks if the lists contents contain all of the same elements.
 func podListEqual(list1 []*v1.Pod, list2 []*v1.Pod) bool {
 	if len(list1) != len(list2) {
 		return false
 	}
-	for _, a := range list1 {
-		contains := false
-		for _, b := range list2 {
-			if a == b {
-				contains = true
-			}
-		}
-		if !contains {
+
+	m := map[*v1.Pod]int{}
+	for _, val := range list1 {
+		m[val] = m[val] + 1
+	}
+	for _, val := range list2 {
+		m[val] = m[val] - 1
+	}
+	for _, v := range m {
+		if v != 0 {
 			return false
 		}
 	}

@@ -14,62 +14,86 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package volume implements a controller to manage volume attach and detach
+// Package attachdetach implements a controller to manage volume attach and detach
 // operations.
 package attachdetach
 
 import (
 	"fmt"
 	"net"
+	"reflect"
 	"time"
 
 	"github.com/golang/glog"
+	authenticationv1 "k8s.io/api/authentication/v1"
+	"k8s.io/api/core/v1"
+	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	coreinformers "k8s.io/client-go/informers/core/v1"
+	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
-	clientv1 "k8s.io/client-go/pkg/api/v1"
+	corelisters "k8s.io/client-go/listers/core/v1"
 	kcache "k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
-	coreinformers "k8s.io/kubernetes/pkg/client/informers/informers_generated/externalversions/core/v1"
-	corelisters "k8s.io/kubernetes/pkg/client/listers/core/v1"
+	"k8s.io/client-go/util/workqueue"
+	csiapiv1alpha1 "k8s.io/csi-api/pkg/apis/csi/v1alpha1"
+	csiclient "k8s.io/csi-api/pkg/client/clientset/versioned"
 	"k8s.io/kubernetes/pkg/cloudprovider"
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/controller/volume/attachdetach/cache"
+	"k8s.io/kubernetes/pkg/controller/volume/attachdetach/metrics"
 	"k8s.io/kubernetes/pkg/controller/volume/attachdetach/populator"
 	"k8s.io/kubernetes/pkg/controller/volume/attachdetach/reconciler"
 	"k8s.io/kubernetes/pkg/controller/volume/attachdetach/statusupdater"
 	"k8s.io/kubernetes/pkg/controller/volume/attachdetach/util"
-	"k8s.io/kubernetes/pkg/util/io"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/util/mount"
 	"k8s.io/kubernetes/pkg/volume"
+	volumeutil "k8s.io/kubernetes/pkg/volume/util"
 	"k8s.io/kubernetes/pkg/volume/util/operationexecutor"
-	"k8s.io/kubernetes/pkg/volume/util/volumehelper"
+	"k8s.io/kubernetes/pkg/volume/util/volumepathhandler"
 )
 
-const (
-	// loopPeriod is the amount of time the reconciler loop waits between
-	// successive executions
-	reconcilerLoopPeriod time.Duration = 100 * time.Millisecond
+// TimerConfig contains configuration of internal attach/detach timers and
+// should be used only to speed up tests. DefaultTimerConfig is the suggested
+// timer configuration for production.
+type TimerConfig struct {
+	// ReconcilerLoopPeriod is the amount of time the reconciler loop waits
+	// between successive executions
+	ReconcilerLoopPeriod time.Duration
 
-	// reconcilerMaxWaitForUnmountDuration is the maximum amount of time the
+	// ReconcilerMaxWaitForUnmountDuration is the maximum amount of time the
 	// attach detach controller will wait for a volume to be safely unmounted
 	// from its node. Once this time has expired, the controller will assume the
 	// node or kubelet are unresponsive and will detach the volume anyway.
-	reconcilerMaxWaitForUnmountDuration time.Duration = 6 * time.Minute
+	ReconcilerMaxWaitForUnmountDuration time.Duration
 
-	// desiredStateOfWorldPopulatorLoopSleepPeriod is the amount of time the
+	// DesiredStateOfWorldPopulatorLoopSleepPeriod is the amount of time the
 	// DesiredStateOfWorldPopulator loop waits between successive executions
-	desiredStateOfWorldPopulatorLoopSleepPeriod time.Duration = 1 * time.Minute
+	DesiredStateOfWorldPopulatorLoopSleepPeriod time.Duration
 
-	// desiredStateOfWorldPopulatorListPodsRetryDuration is the amount of
+	// DesiredStateOfWorldPopulatorListPodsRetryDuration is the amount of
 	// time the DesiredStateOfWorldPopulator loop waits between list pods
 	// calls.
-	desiredStateOfWorldPopulatorListPodsRetryDuration time.Duration = 3 * time.Minute
-)
+	DesiredStateOfWorldPopulatorListPodsRetryDuration time.Duration
+}
+
+// DefaultTimerConfig is the default configuration of Attach/Detach controller
+// timers.
+var DefaultTimerConfig TimerConfig = TimerConfig{
+	ReconcilerLoopPeriod:                              100 * time.Millisecond,
+	ReconcilerMaxWaitForUnmountDuration:               6 * time.Minute,
+	DesiredStateOfWorldPopulatorLoopSleepPeriod:       1 * time.Minute,
+	DesiredStateOfWorldPopulatorListPodsRetryDuration: 3 * time.Minute,
+}
 
 // AttachDetachController defines the operations supported by this controller.
 type AttachDetachController interface {
@@ -80,14 +104,18 @@ type AttachDetachController interface {
 // NewAttachDetachController returns a new instance of AttachDetachController.
 func NewAttachDetachController(
 	kubeClient clientset.Interface,
+	csiClient csiclient.Interface,
+	crdClient apiextensionsclient.Interface,
 	podInformer coreinformers.PodInformer,
 	nodeInformer coreinformers.NodeInformer,
 	pvcInformer coreinformers.PersistentVolumeClaimInformer,
 	pvInformer coreinformers.PersistentVolumeInformer,
 	cloud cloudprovider.Interface,
 	plugins []volume.VolumePlugin,
+	prober volume.DynamicPluginProber,
 	disableReconciliationSync bool,
-	reconcilerSyncDuration time.Duration) (AttachDetachController, error) {
+	reconcilerSyncDuration time.Duration,
+	timerConfig TimerConfig) (AttachDetachController, error) {
 	// TODO: The default resyncPeriod for shared informers is 12 hours, this is
 	// unacceptable for the attach/detach controller. For example, if a pod is
 	// skipped because the node it is scheduled to didn't set its annotation in
@@ -104,25 +132,35 @@ func NewAttachDetachController(
 	// deleted (probably can't do this with sharedInformer), etc.
 	adc := &attachDetachController{
 		kubeClient:  kubeClient,
+		csiClient:   csiClient,
+		crdClient:   crdClient,
 		pvcLister:   pvcInformer.Lister(),
 		pvcsSynced:  pvcInformer.Informer().HasSynced,
 		pvLister:    pvInformer.Lister(),
 		pvsSynced:   pvInformer.Informer().HasSynced,
 		podLister:   podInformer.Lister(),
 		podsSynced:  podInformer.Informer().HasSynced,
+		podIndexer:  podInformer.Informer().GetIndexer(),
 		nodeLister:  nodeInformer.Lister(),
 		nodesSynced: nodeInformer.Informer().HasSynced,
 		cloud:       cloud,
+		pvcQueue:    workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "pvcs"),
 	}
 
-	if err := adc.volumePluginMgr.InitPlugins(plugins, adc); err != nil {
+	// Install required CSI CRDs on API server
+	if utilfeature.DefaultFeatureGate.Enabled(features.CSICRDAutoInstall) {
+		adc.installCRDs()
+	}
+
+	if err := adc.volumePluginMgr.InitPlugins(plugins, prober, adc); err != nil {
 		return nil, fmt.Errorf("Could not initialize volume plugins for Attach/Detach Controller: %+v", err)
 	}
 
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartLogging(glog.Infof)
-	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: v1core.New(kubeClient.Core().RESTClient()).Events("")})
-	recorder := eventBroadcaster.NewRecorder(api.Scheme, clientv1.EventSource{Component: "attachdetach"})
+	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: kubeClient.CoreV1().Events("")})
+	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "attachdetach-controller"})
+	blkutil := volumepathhandler.NewBlockVolumePathHandler()
 
 	adc.desiredStateOfWorld = cache.NewDesiredStateOfWorld(&adc.volumePluginMgr)
 	adc.actualStateOfWorld = cache.NewActualStateOfWorld(&adc.volumePluginMgr)
@@ -131,24 +169,26 @@ func NewAttachDetachController(
 			kubeClient,
 			&adc.volumePluginMgr,
 			recorder,
-			false)) // flag for experimental binary check for volume mount
+			false, // flag for experimental binary check for volume mount
+			blkutil))
 	adc.nodeStatusUpdater = statusupdater.NewNodeStatusUpdater(
 		kubeClient, nodeInformer.Lister(), adc.actualStateOfWorld)
 
 	// Default these to values in options
 	adc.reconciler = reconciler.NewReconciler(
-		reconcilerLoopPeriod,
-		reconcilerMaxWaitForUnmountDuration,
+		timerConfig.ReconcilerLoopPeriod,
+		timerConfig.ReconcilerMaxWaitForUnmountDuration,
 		reconcilerSyncDuration,
 		disableReconciliationSync,
 		adc.desiredStateOfWorld,
 		adc.actualStateOfWorld,
 		adc.attacherDetacher,
-		adc.nodeStatusUpdater)
+		adc.nodeStatusUpdater,
+		recorder)
 
 	adc.desiredStateOfWorldPopulator = populator.NewDesiredStateOfWorldPopulator(
-		desiredStateOfWorldPopulatorLoopSleepPeriod,
-		desiredStateOfWorldPopulatorListPodsRetryDuration,
+		timerConfig.DesiredStateOfWorldPopulatorLoopSleepPeriod,
+		timerConfig.DesiredStateOfWorldPopulatorListPodsRetryDuration,
 		podInformer.Lister(),
 		adc.desiredStateOfWorld,
 		&adc.volumePluginMgr,
@@ -161,19 +201,66 @@ func NewAttachDetachController(
 		DeleteFunc: adc.podDelete,
 	})
 
+	// This custom indexer will index pods by its PVC keys. Then we don't need
+	// to iterate all pods every time to find pods which reference given PVC.
+	adc.podIndexer.AddIndexers(kcache.Indexers{
+		pvcKeyIndex: indexByPVCKey,
+	})
+
 	nodeInformer.Informer().AddEventHandler(kcache.ResourceEventHandlerFuncs{
 		AddFunc:    adc.nodeAdd,
 		UpdateFunc: adc.nodeUpdate,
 		DeleteFunc: adc.nodeDelete,
 	})
 
+	pvcInformer.Informer().AddEventHandler(kcache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			adc.enqueuePVC(obj)
+		},
+		UpdateFunc: func(old, new interface{}) {
+			adc.enqueuePVC(new)
+		},
+	})
+
 	return adc, nil
+}
+
+const (
+	pvcKeyIndex string = "pvcKey"
+)
+
+// indexByPVCKey returns PVC keys for given pod. Note that the index is only
+// used for attaching, so we are only interested in active pods with nodeName
+// set.
+func indexByPVCKey(obj interface{}) ([]string, error) {
+	pod, ok := obj.(*v1.Pod)
+	if !ok {
+		return []string{}, nil
+	}
+	if len(pod.Spec.NodeName) == 0 || volumeutil.IsPodTerminated(pod, pod.Status) {
+		return []string{}, nil
+	}
+	keys := []string{}
+	for _, podVolume := range pod.Spec.Volumes {
+		if pvcSource := podVolume.VolumeSource.PersistentVolumeClaim; pvcSource != nil {
+			keys = append(keys, fmt.Sprintf("%s/%s", pod.Namespace, pvcSource.ClaimName))
+		}
+	}
+	return keys, nil
 }
 
 type attachDetachController struct {
 	// kubeClient is the kube API client used by volumehost to communicate with
 	// the API server.
 	kubeClient clientset.Interface
+
+	// csiClient is the client used to read/write csi.storage.k8s.io API objects
+	// from the API server.
+	csiClient csiclient.Interface
+
+	// crdClient is the client used to read/write apiextensions.k8s.io objects
+	// from the API server.
+	crdClient apiextensionsclient.Interface
 
 	// pvcLister is the shared PVC lister used to fetch and store PVC
 	// objects from the API server. It is shared with other controllers and
@@ -189,6 +276,7 @@ type attachDetachController struct {
 
 	podLister  corelisters.PodLister
 	podsSynced kcache.InformerSynced
+	podIndexer kcache.Indexer
 
 	nodeLister  corelisters.NodeLister
 	nodesSynced kcache.InformerSynced
@@ -233,10 +321,14 @@ type attachDetachController struct {
 
 	// recorder is used to record events in the API server
 	recorder record.EventRecorder
+
+	// pvcQueue is used to queue pvc objects
+	pvcQueue workqueue.RateLimitingInterface
 }
 
 func (adc *attachDetachController) Run(stopCh <-chan struct{}) {
 	defer runtime.HandleCrash()
+	defer adc.pvcQueue.ShutDown()
 
 	glog.Infof("Starting attach detach controller")
 	defer glog.Infof("Shutting down attach detach controller")
@@ -255,6 +347,13 @@ func (adc *attachDetachController) Run(stopCh <-chan struct{}) {
 	}
 	go adc.reconciler.Run(stopCh)
 	go adc.desiredStateOfWorldPopulator.Run(stopCh)
+	go wait.Until(adc.pvcWorker, time.Second, stopCh)
+	metrics.Register(adc.pvcLister,
+		adc.pvLister,
+		adc.podLister,
+		adc.actualStateOfWorld,
+		adc.desiredStateOfWorld,
+		&adc.volumePluginMgr)
 
 	<-stopCh
 }
@@ -280,12 +379,8 @@ func (adc *attachDetachController) populateActualStateOfWorld() error {
 				glog.Errorf("Failed to mark the volume as attached: %v", err)
 				continue
 			}
-			adc.processVolumesInUse(nodeName, node.Status.VolumesInUse, true /* forceUnmount */)
-			if _, exists := node.Annotations[volumehelper.ControllerManagedAttachAnnotation]; exists {
-				// Node specifies annotation indicating it should be managed by
-				// attach detach controller. Add it to desired state of world.
-				adc.desiredStateOfWorld.AddNode(types.NodeName(node.Name)) // Needed for DesiredStateOfWorld population
-			}
+			adc.processVolumesInUse(nodeName, node.Status.VolumesInUse)
+			adc.addNodeToDswp(node, types.NodeName(node.Name))
 		}
 	}
 	return nil
@@ -322,7 +417,7 @@ func (adc *attachDetachController) populateDesiredStateOfWorld() error {
 	}
 	for _, pod := range pods {
 		podToAdd := pod
-		adc.podAdd(&podToAdd)
+		adc.podAdd(podToAdd)
 		for _, podVolume := range podToAdd.Spec.Volumes {
 			// The volume specs present in the ActualStateOfWorld are nil, let's replace those
 			// with the correct ones found on pods. The present in the ASW with no corresponding
@@ -348,7 +443,7 @@ func (adc *attachDetachController) populateDesiredStateOfWorld() error {
 					err)
 				continue
 			}
-			volumeName, err := volumehelper.GetUniqueVolumeNameFromSpec(plugin, volumeSpec)
+			volumeName, err := volumeutil.GetUniqueVolumeNameFromSpec(plugin, volumeSpec)
 			if err != nil {
 				glog.Errorf(
 					"Failed to find unique name for volume %q, pod %q/%q: %v",
@@ -385,7 +480,12 @@ func (adc *attachDetachController) podAdd(obj interface{}) {
 		return
 	}
 
-	util.ProcessPodVolumes(pod, true, /* addVolumes */
+	volumeActionFlag := util.DetermineVolumeAction(
+		pod,
+		adc.desiredStateOfWorld,
+		true /* default volume action */)
+
+	util.ProcessPodVolumes(pod, volumeActionFlag, /* addVolumes */
 		adc.desiredStateOfWorld, &adc.volumePluginMgr, adc.pvcLister, adc.pvLister)
 }
 
@@ -395,8 +495,22 @@ func (adc *attachDetachController) GetDesiredStateOfWorld() cache.DesiredStateOf
 }
 
 func (adc *attachDetachController) podUpdate(oldObj, newObj interface{}) {
-	// The flow for update is the same as add.
-	adc.podAdd(newObj)
+	pod, ok := newObj.(*v1.Pod)
+	if pod == nil || !ok {
+		return
+	}
+	if pod.Spec.NodeName == "" {
+		// Ignore pods without NodeName, indicating they are not scheduled.
+		return
+	}
+
+	volumeActionFlag := util.DetermineVolumeAction(
+		pod,
+		adc.desiredStateOfWorld,
+		true /* default volume action */)
+
+	util.ProcessPodVolumes(pod, volumeActionFlag, /* addVolumes */
+		adc.desiredStateOfWorld, &adc.volumePluginMgr, adc.pvcLister, adc.pvLister)
 }
 
 func (adc *attachDetachController) podDelete(obj interface{}) {
@@ -433,12 +547,8 @@ func (adc *attachDetachController) nodeUpdate(oldObj, newObj interface{}) {
 	}
 
 	nodeName := types.NodeName(node.Name)
-	if _, exists := node.Annotations[volumehelper.ControllerManagedAttachAnnotation]; exists {
-		// Node specifies annotation indicating it should be managed by attach
-		// detach controller. Add it to desired state of world.
-		adc.desiredStateOfWorld.AddNode(nodeName)
-	}
-	adc.processVolumesInUse(nodeName, node.Status.VolumesInUse, false /* forceUnmount */)
+	adc.addNodeToDswp(node, nodeName)
+	adc.processVolumesInUse(nodeName, node.Status.VolumesInUse)
 }
 
 func (adc *attachDetachController) nodeDelete(obj interface{}) {
@@ -449,10 +559,88 @@ func (adc *attachDetachController) nodeDelete(obj interface{}) {
 
 	nodeName := types.NodeName(node.Name)
 	if err := adc.desiredStateOfWorld.DeleteNode(nodeName); err != nil {
-		glog.V(10).Infof("%v", err)
+		// This might happen during drain, but we still want it to appear in our logs
+		glog.Infof("error removing node %q from desired-state-of-world: %v", nodeName, err)
 	}
 
-	adc.processVolumesInUse(nodeName, node.Status.VolumesInUse, false /* forceUnmount */)
+	adc.processVolumesInUse(nodeName, node.Status.VolumesInUse)
+}
+
+func (adc *attachDetachController) enqueuePVC(obj interface{}) {
+	key, err := kcache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+	if err != nil {
+		runtime.HandleError(fmt.Errorf("Couldn't get key for object %+v: %v", obj, err))
+		return
+	}
+	adc.pvcQueue.Add(key)
+}
+
+// pvcWorker processes items from pvcQueue
+func (adc *attachDetachController) pvcWorker() {
+	for adc.processNextItem() {
+	}
+}
+
+func (adc *attachDetachController) processNextItem() bool {
+	keyObj, shutdown := adc.pvcQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer adc.pvcQueue.Done(keyObj)
+
+	if err := adc.syncPVCByKey(keyObj.(string)); err != nil {
+		// Rather than wait for a full resync, re-add the key to the
+		// queue to be processed.
+		adc.pvcQueue.AddRateLimited(keyObj)
+		runtime.HandleError(fmt.Errorf("Failed to sync pvc %q, will retry again: %v", keyObj.(string), err))
+		return true
+	}
+
+	// Finally, if no error occurs we Forget this item so it does not
+	// get queued again until another change happens.
+	adc.pvcQueue.Forget(keyObj)
+	return true
+}
+
+func (adc *attachDetachController) syncPVCByKey(key string) error {
+	glog.V(5).Infof("syncPVCByKey[%s]", key)
+	namespace, name, err := kcache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		glog.V(4).Infof("error getting namespace & name of pvc %q to get pvc from informer: %v", key, err)
+		return nil
+	}
+	pvc, err := adc.pvcLister.PersistentVolumeClaims(namespace).Get(name)
+	if apierrors.IsNotFound(err) {
+		glog.V(4).Infof("error getting pvc %q from informer: %v", key, err)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	if pvc.Status.Phase != v1.ClaimBound || pvc.Spec.VolumeName == "" {
+		// Skip unbound PVCs.
+		return nil
+	}
+
+	objs, err := adc.podIndexer.ByIndex(pvcKeyIndex, key)
+	if err != nil {
+		return err
+	}
+	for _, obj := range objs {
+		pod, ok := obj.(*v1.Pod)
+		if !ok {
+			continue
+		}
+		volumeActionFlag := util.DetermineVolumeAction(
+			pod,
+			adc.desiredStateOfWorld,
+			true /* default volume action */)
+
+		util.ProcessPodVolumes(pod, volumeActionFlag, /* addVolumes */
+			adc.desiredStateOfWorld, &adc.volumePluginMgr, adc.pvcLister, adc.pvLister)
+	}
+	return nil
 }
 
 // processVolumesInUse processes the list of volumes marked as "in-use"
@@ -460,7 +648,7 @@ func (adc *attachDetachController) nodeDelete(obj interface{}) {
 // corresponding volume in the actual state of the world to indicate that it is
 // mounted.
 func (adc *attachDetachController) processVolumesInUse(
-	nodeName types.NodeName, volumesInUse []v1.UniqueVolumeName, forceUnmount bool) {
+	nodeName types.NodeName, volumesInUse []v1.UniqueVolumeName) {
 	glog.V(4).Infof("processVolumesInUse for node %q", nodeName)
 	for _, attachedVolume := range adc.actualStateOfWorld.GetAttachedVolumesForNode(nodeName) {
 		mounted := false
@@ -470,14 +658,74 @@ func (adc *attachDetachController) processVolumesInUse(
 				break
 			}
 		}
-		err := adc.actualStateOfWorld.SetVolumeMountedByNode(
-			attachedVolume.VolumeName, nodeName, mounted, forceUnmount)
+		err := adc.actualStateOfWorld.SetVolumeMountedByNode(attachedVolume.VolumeName, nodeName, mounted)
 		if err != nil {
 			glog.Warningf(
-				"SetVolumeMountedByNode(%q, %q, %q) returned an error: %v",
+				"SetVolumeMountedByNode(%q, %q, %v) returned an error: %v",
 				attachedVolume.VolumeName, nodeName, mounted, err)
 		}
 	}
+}
+
+// installCRDs creates the specified CustomResourceDefinition for the CSIDrivers object.
+func (adc *attachDetachController) installCRDs() error {
+	crd := &apiextensionsv1beta1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: csiapiv1alpha1.CsiDriverResourcePlural + "." + csiapiv1alpha1.GroupName,
+		},
+		Spec: apiextensionsv1beta1.CustomResourceDefinitionSpec{
+			Group:   csiapiv1alpha1.GroupName,
+			Version: csiapiv1alpha1.SchemeGroupVersion.Version,
+			Scope:   apiextensionsv1beta1.ClusterScoped,
+			Names: apiextensionsv1beta1.CustomResourceDefinitionNames{
+				Plural: csiapiv1alpha1.CsiDriverResourcePlural,
+				Kind:   reflect.TypeOf(csiapiv1alpha1.CSIDriver{}).Name(),
+			},
+		},
+	}
+	res, err := adc.crdClient.ApiextensionsV1beta1().CustomResourceDefinitions().Create(crd)
+
+	if err == nil {
+		glog.Infof("CSIDrivers CRD created successfully: %#v",
+			res)
+	} else if apierrors.IsAlreadyExists(err) {
+		glog.Warningf("CSIDrivers CRD already exists: %#v, err: %#v",
+			res, err)
+	} else {
+		glog.Errorf("failed to create CSIDrivers CRD: %#v, err: %#v",
+			res, err)
+		return err
+	}
+
+	crd = &apiextensionsv1beta1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: csiapiv1alpha1.CsiNodeInfoResourcePlural + "." + csiapiv1alpha1.GroupName,
+		},
+		Spec: apiextensionsv1beta1.CustomResourceDefinitionSpec{
+			Group:   csiapiv1alpha1.GroupName,
+			Version: csiapiv1alpha1.SchemeGroupVersion.Version,
+			Scope:   apiextensionsv1beta1.ClusterScoped,
+			Names: apiextensionsv1beta1.CustomResourceDefinitionNames{
+				Plural: csiapiv1alpha1.CsiNodeInfoResourcePlural,
+				Kind:   reflect.TypeOf(csiapiv1alpha1.CSINodeInfo{}).Name(),
+			},
+		},
+	}
+	res, err = adc.crdClient.ApiextensionsV1beta1().CustomResourceDefinitions().Create(crd)
+
+	if err == nil {
+		glog.Infof("CSINodeInfo CRD created successfully: %#v",
+			res)
+	} else if apierrors.IsAlreadyExists(err) {
+		glog.Warningf("CSINodeInfo CRD already exists: %#v, err: %#v",
+			res, err)
+	} else {
+		glog.Errorf("failed to create CSINodeInfo CRD: %#v, err: %#v",
+			res, err)
+		return err
+	}
+
+	return nil
 }
 
 // VolumeHost implementation
@@ -490,11 +738,23 @@ func (adc *attachDetachController) GetPluginDir(podUID string) string {
 	return ""
 }
 
+func (adc *attachDetachController) GetVolumeDevicePluginDir(podUID string) string {
+	return ""
+}
+
+func (adc *attachDetachController) GetPodsDir() string {
+	return ""
+}
+
 func (adc *attachDetachController) GetPodVolumeDir(podUID types.UID, pluginName, volumeName string) string {
 	return ""
 }
 
 func (adc *attachDetachController) GetPodPluginDir(podUID types.UID, pluginName string) string {
+	return ""
+}
+
+func (adc *attachDetachController) GetPodVolumeDeviceDir(podUID types.UID, pluginName string) string {
 	return ""
 }
 
@@ -514,11 +774,7 @@ func (adc *attachDetachController) GetCloudProvider() cloudprovider.Interface {
 	return adc.cloud
 }
 
-func (adc *attachDetachController) GetMounter() mount.Interface {
-	return nil
-}
-
-func (adc *attachDetachController) GetWriter() io.Writer {
+func (adc *attachDetachController) GetMounter(pluginName string) mount.Interface {
 	return nil
 }
 
@@ -538,4 +794,50 @@ func (adc *attachDetachController) GetSecretFunc() func(namespace, name string) 
 	return func(_, _ string) (*v1.Secret, error) {
 		return nil, fmt.Errorf("GetSecret unsupported in attachDetachController")
 	}
+}
+
+func (adc *attachDetachController) GetConfigMapFunc() func(namespace, name string) (*v1.ConfigMap, error) {
+	return func(_, _ string) (*v1.ConfigMap, error) {
+		return nil, fmt.Errorf("GetConfigMap unsupported in attachDetachController")
+	}
+}
+
+func (adc *attachDetachController) GetServiceAccountTokenFunc() func(_, _ string, _ *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
+	return func(_, _ string, _ *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
+		return nil, fmt.Errorf("GetServiceAccountToken unsupported in attachDetachController")
+	}
+}
+
+func (adc *attachDetachController) GetExec(pluginName string) mount.Exec {
+	return mount.NewOsExec()
+}
+
+func (adc *attachDetachController) addNodeToDswp(node *v1.Node, nodeName types.NodeName) {
+	if _, exists := node.Annotations[volumeutil.ControllerManagedAttachAnnotation]; exists {
+		keepTerminatedPodVolumes := false
+
+		if t, ok := node.Annotations[volumeutil.KeepTerminatedPodVolumesAnnotation]; ok {
+			keepTerminatedPodVolumes = (t == "true")
+		}
+
+		// Node specifies annotation indicating it should be managed by attach
+		// detach controller. Add it to desired state of world.
+		adc.desiredStateOfWorld.AddNode(nodeName, keepTerminatedPodVolumes)
+	}
+}
+
+func (adc *attachDetachController) GetNodeLabels() (map[string]string, error) {
+	return nil, fmt.Errorf("GetNodeLabels() unsupported in Attach/Detach controller")
+}
+
+func (adc *attachDetachController) GetNodeName() types.NodeName {
+	return ""
+}
+
+func (adc *attachDetachController) GetEventRecorder() record.EventRecorder {
+	return adc.recorder
+}
+
+func (adc *attachDetachController) GetCSIClient() csiclient.Interface {
+	return adc.csiClient
 }

@@ -32,8 +32,9 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/pkg/api"
+	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd/api/v1"
 )
@@ -69,24 +70,6 @@ var (
 	retryBackoff  = time.Duration(500) * time.Millisecond
 )
 
-// TestDisabledGroupVersion ensures that requiring a group version works as expected
-func TestDisabledGroupVersion(t *testing.T) {
-	gv := schema.GroupVersion{Group: "webhook.util.k8s.io", Version: "v1"}
-	gvs := []schema.GroupVersion{gv}
-	_, err := NewGenericWebhook(api.Registry, api.Codecs, "/some/path", gvs, retryBackoff)
-
-	if err == nil {
-		t.Errorf("expected an error")
-	} else {
-		aErrMsg := err.Error()
-		eErrMsg := fmt.Sprintf("webhook plugin requires enabling extension resource: %s", gv)
-
-		if aErrMsg != eErrMsg {
-			t.Errorf("unexpected error message mismatch:\n  Expected: %s\n  Actual:   %s", eErrMsg, aErrMsg)
-		}
-	}
-}
-
 // TestKubeConfigFile ensures that a kube config file, regardless of validity, is handled properly
 func TestKubeConfigFile(t *testing.T) {
 	badCAPath := "/tmp/missing/ca.pem"
@@ -112,15 +95,15 @@ func TestKubeConfigFile(t *testing.T) {
 			errRegex: errNoConfiguration,
 		},
 		{
-			test:           "missing context (specified context is missing)",
-			cluster:        &namedCluster,
-			currentContext: "missing-context",
-			errRegex:       errNoConfiguration,
+			test:     "missing context (specified context is missing)",
+			cluster:  &namedCluster,
+			errRegex: errNoConfiguration,
 		},
 		{
 			test: "context without cluster",
 			context: &v1.NamedContext{
 				Context: v1.Context{},
+				Name:    "testing-context",
 			},
 			currentContext: "testing-context",
 			errRegex:       errNoConfiguration,
@@ -132,6 +115,7 @@ func TestKubeConfigFile(t *testing.T) {
 				Context: v1.Context{
 					Cluster: namedCluster.Name,
 				},
+				Name: "testing-context",
 			},
 			currentContext: "testing-context",
 			errRegex:       "", // Not an error at parse time, only when using the webhook
@@ -143,6 +127,7 @@ func TestKubeConfigFile(t *testing.T) {
 				Context: v1.Context{
 					Cluster: "missing-cluster",
 				},
+				Name: "fake",
 			},
 			errRegex: errNoConfiguration,
 		},
@@ -154,6 +139,7 @@ func TestKubeConfigFile(t *testing.T) {
 					Cluster:  namedCluster.Name,
 					AuthInfo: "missing-user",
 				},
+				Name: "testing-context",
 			},
 			currentContext: "testing-context",
 			errRegex:       "", // Not an error at parse time, only when using the webhook
@@ -225,7 +211,7 @@ func TestKubeConfigFile(t *testing.T) {
 			errRegex: "tls: found a certificate rather than a key in the PEM for the private key",
 		},
 		{
-			test:     "valid configuration (certificate data embeded in config)",
+			test:     "valid configuration (certificate data embedded in config)",
 			cluster:  &defaultCluster,
 			user:     &defaultUser,
 			errRegex: "",
@@ -265,12 +251,14 @@ func TestKubeConfigFile(t *testing.T) {
 				kubeConfig.AuthInfos = []v1.NamedAuthInfo{*tt.user}
 			}
 
+			kubeConfig.CurrentContext = tt.currentContext
+
 			kubeConfigFile, err := newKubeConfigFile(kubeConfig)
 
 			if err == nil {
 				defer os.Remove(kubeConfigFile)
 
-				_, err = NewGenericWebhook(api.Registry, api.Codecs, kubeConfigFile, groupVersions, retryBackoff)
+				_, err = NewGenericWebhook(runtime.NewScheme(), scheme.Codecs, kubeConfigFile, groupVersions, retryBackoff)
 			}
 
 			return err
@@ -293,7 +281,7 @@ func TestKubeConfigFile(t *testing.T) {
 // TestMissingKubeConfigFile ensures that a kube config path to a missing file is handled properly
 func TestMissingKubeConfigFile(t *testing.T) {
 	kubeConfigPath := "/some/missing/path"
-	_, err := NewGenericWebhook(api.Registry, api.Codecs, kubeConfigPath, groupVersions, retryBackoff)
+	_, err := NewGenericWebhook(runtime.NewScheme(), scheme.Codecs, kubeConfigPath, groupVersions, retryBackoff)
 
 	if err == nil {
 		t.Errorf("creating the webhook should had failed")
@@ -405,7 +393,7 @@ func TestTLSConfig(t *testing.T) {
 
 			defer os.Remove(configFile)
 
-			wh, err := NewGenericWebhook(api.Registry, api.Codecs, configFile, groupVersions, retryBackoff)
+			wh, err := NewGenericWebhook(runtime.NewScheme(), scheme.Codecs, configFile, groupVersions, retryBackoff)
 
 			if err == nil {
 				err = wh.RestClient.Get().Do().Error()
@@ -423,6 +411,65 @@ func TestTLSConfig(t *testing.T) {
 				}
 			}
 		}()
+	}
+}
+
+func TestRequestTimeout(t *testing.T) {
+	done := make(chan struct{})
+
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		<-done
+		return
+	}
+
+	// Create and start a simple HTTPS server
+	server, err := newTestServer(clientCert, clientKey, caCert, handler)
+	if err != nil {
+		t.Errorf("failed to create server: %v", err)
+		return
+	}
+	defer server.Close()
+	defer close(done) // done channel must be closed before server is.
+
+	// Create a Kubernetes client configuration file
+	configFile, err := newKubeConfigFile(v1.Config{
+		Clusters: []v1.NamedCluster{
+			{
+				Cluster: v1.Cluster{
+					Server: server.URL,
+					CertificateAuthorityData: caCert,
+				},
+			},
+		},
+		AuthInfos: []v1.NamedAuthInfo{
+			{
+				AuthInfo: v1.AuthInfo{
+					ClientCertificateData: clientCert,
+					ClientKeyData:         clientKey,
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Errorf("failed to create the client config file: %v", err)
+		return
+	}
+	defer os.Remove(configFile)
+
+	var requestTimeout = 10 * time.Millisecond
+
+	wh, err := newGenericWebhook(runtime.NewScheme(), scheme.Codecs, configFile, groupVersions, retryBackoff, requestTimeout)
+	if err != nil {
+		t.Fatalf("failed to create the webhook: %v", err)
+	}
+
+	resultCh := make(chan rest.Result)
+
+	go func() { resultCh <- wh.RestClient.Get().Do() }()
+	select {
+	case <-time.After(time.Second * 5):
+		t.Errorf("expected request to timeout after %s", requestTimeout)
+	case <-resultCh:
 	}
 }
 
@@ -497,7 +544,7 @@ func TestWithExponentialBackoff(t *testing.T) {
 
 	defer os.Remove(configFile)
 
-	wh, err := NewGenericWebhook(api.Registry, api.Codecs, configFile, groupVersions, retryBackoff)
+	wh, err := NewGenericWebhook(runtime.NewScheme(), scheme.Codecs, configFile, groupVersions, retryBackoff)
 
 	if err != nil {
 		t.Fatalf("failed to create the webhook: %v", err)

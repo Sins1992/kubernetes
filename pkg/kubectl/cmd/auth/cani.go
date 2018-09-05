@@ -19,18 +19,17 @@ package auth
 import (
 	"errors"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
 
+	authorizationv1 "k8s.io/api/authorization/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	utilerrors "k8s.io/apimachinery/pkg/util/errors"
-	authorizationapi "k8s.io/kubernetes/pkg/apis/authorization"
-	internalauthorizationclient "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/authorization/internalversion"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
+	authorizationv1client "k8s.io/client-go/kubernetes/typed/authorization/v1"
 	"k8s.io/kubernetes/pkg/kubectl/cmd/templates"
 	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
 )
@@ -41,14 +40,15 @@ type CanIOptions struct {
 	AllNamespaces bool
 	Quiet         bool
 	Namespace     string
-	SelfSARClient internalauthorizationclient.SelfSubjectAccessReviewsGetter
+	SelfSARClient authorizationv1client.SelfSubjectAccessReviewsGetter
 
-	Verb         string
-	Resource     schema.GroupVersionResource
-	ResourceName string
+	Verb           string
+	Resource       schema.GroupVersionResource
+	NonResourceURL string
+	Subresource    string
+	ResourceName   string
 
-	Out io.Writer
-	Err io.Writer
+	genericclioptions.IOStreams
 }
 
 var (
@@ -56,7 +56,8 @@ var (
 		Check whether an action is allowed.
 
 		VERB is a logical Kubernetes API verb like 'get', 'list', 'watch', 'delete', etc.
-		TYPE is a Kubernetes resource.  Shortcuts and groups will be resolved.
+		TYPE is a Kubernetes resource. Shortcuts and groups will be resolved.
+		NONRESOURCEURL is a partial URL starts with "/".
 		NAME is the name of a particular Kubernetes resource.`)
 
 	canIExample = templates.Examples(`
@@ -70,17 +71,23 @@ var (
 		kubectl auth can-i '*' '*'
 
 		# Check to see if I can get the job named "bar" in namespace "foo"
-		kubectl auth can-i list jobs.batch/bar -n foo`)
+		kubectl auth can-i list jobs.batch/bar -n foo
+
+		# Check to see if I can read pod logs
+		kubectl auth can-i get pods --subresource=log
+
+		# Check to see if I can access the URL /logs/
+		kubectl auth can-i get /logs/`)
 )
 
-func NewCmdCanI(f cmdutil.Factory, out, err io.Writer) *cobra.Command {
+func NewCmdCanI(f cmdutil.Factory, streams genericclioptions.IOStreams) *cobra.Command {
 	o := &CanIOptions{
-		Out: out,
-		Err: err,
+		IOStreams: streams,
 	}
 
 	cmd := &cobra.Command{
-		Use:     "can-i VERB [TYPE | TYPE/NAME]",
+		Use: "can-i VERB [TYPE | TYPE/NAME | NONRESOURCEURL]",
+		DisableFlagsInUseLine: true,
 		Short:   "Check whether an action is allowed",
 		Long:    canILong,
 		Example: canIExample,
@@ -90,7 +97,7 @@ func NewCmdCanI(f cmdutil.Factory, out, err io.Writer) *cobra.Command {
 
 			allowed, err := o.RunAccessCheck()
 			if err == nil {
-				if o.Quiet && !allowed {
+				if !allowed {
 					os.Exit(1)
 				}
 			}
@@ -101,6 +108,7 @@ func NewCmdCanI(f cmdutil.Factory, out, err io.Writer) *cobra.Command {
 
 	cmd.Flags().BoolVar(&o.AllNamespaces, "all-namespaces", o.AllNamespaces, "If true, check the specified action in all namespaces.")
 	cmd.Flags().BoolVarP(&o.Quiet, "quiet", "q", o.Quiet, "If true, suppress output and just return the exit code.")
+	cmd.Flags().StringVar(&o.Subresource, "subresource", o.Subresource, "SubResource such as pod/log or deployment/scale")
 	return cmd
 }
 
@@ -111,9 +119,16 @@ func (o *CanIOptions) Complete(f cmdutil.Factory, args []string) error {
 
 	switch len(args) {
 	case 2:
-		resourceTokens := strings.SplitN(args[1], "/", 2)
-		restMapper, _ := f.Object()
 		o.Verb = args[0]
+		if strings.HasPrefix(args[1], "/") {
+			o.NonResourceURL = args[1]
+			break
+		}
+		resourceTokens := strings.SplitN(args[1], "/", 2)
+		restMapper, err := f.ToRESTMapper()
+		if err != nil {
+			return err
+		}
 		o.Resource = o.resourceFor(restMapper, resourceTokens[0])
 		if len(resourceTokens) > 1 {
 			o.ResourceName = resourceTokens[1]
@@ -123,15 +138,15 @@ func (o *CanIOptions) Complete(f cmdutil.Factory, args []string) error {
 	}
 
 	var err error
-	client, err := f.ClientSet()
+	client, err := f.KubernetesClientSet()
 	if err != nil {
 		return err
 	}
-	o.SelfSARClient = client.Authorization()
+	o.SelfSARClient = client.AuthorizationV1()
 
 	o.Namespace = ""
 	if !o.AllNamespaces {
-		o.Namespace, _, err = f.DefaultNamespace()
+		o.Namespace, _, err = f.ToRawKubeConfigLoader().Namespace()
 		if err != nil {
 			return err
 		}
@@ -141,21 +156,42 @@ func (o *CanIOptions) Complete(f cmdutil.Factory, args []string) error {
 }
 
 func (o *CanIOptions) Validate() error {
-	errors := []error{}
-	return utilerrors.NewAggregate(errors)
+	if o.NonResourceURL != "" {
+		if o.Subresource != "" {
+			return fmt.Errorf("--subresource can not be used with NonResourceURL")
+		}
+		if o.Resource != (schema.GroupVersionResource{}) || o.ResourceName != "" {
+			return fmt.Errorf("NonResourceURL and ResourceName can not specified together")
+		}
+	}
+	return nil
 }
 
 func (o *CanIOptions) RunAccessCheck() (bool, error) {
-	sar := &authorizationapi.SelfSubjectAccessReview{
-		Spec: authorizationapi.SelfSubjectAccessReviewSpec{
-			ResourceAttributes: &authorizationapi.ResourceAttributes{
-				Namespace: o.Namespace,
-				Verb:      o.Verb,
-				Group:     o.Resource.Group,
-				Resource:  o.Resource.Resource,
-				Name:      o.ResourceName,
+	var sar *authorizationv1.SelfSubjectAccessReview
+	if o.NonResourceURL == "" {
+		sar = &authorizationv1.SelfSubjectAccessReview{
+			Spec: authorizationv1.SelfSubjectAccessReviewSpec{
+				ResourceAttributes: &authorizationv1.ResourceAttributes{
+					Namespace:   o.Namespace,
+					Verb:        o.Verb,
+					Group:       o.Resource.Group,
+					Resource:    o.Resource.Resource,
+					Subresource: o.Subresource,
+					Name:        o.ResourceName,
+				},
 			},
-		},
+		}
+	} else {
+		sar = &authorizationv1.SelfSubjectAccessReview{
+			Spec: authorizationv1.SelfSubjectAccessReviewSpec{
+				NonResourceAttributes: &authorizationv1.NonResourceAttributes{
+					Verb: o.Verb,
+					Path: o.NonResourceURL,
+				},
+			},
+		}
+
 	}
 
 	response, err := o.SelfSARClient.SelfSubjectAccessReviews().Create(sar)
@@ -194,9 +230,9 @@ func (o *CanIOptions) resourceFor(mapper meta.RESTMapper, resourceArg string) sc
 		gvr, err = mapper.ResourceFor(groupResource.WithVersion(""))
 		if err != nil {
 			if len(groupResource.Group) == 0 {
-				fmt.Fprintf(o.Err, "Warning: the server doesn't have a resource type '%s'\n", groupResource.Resource)
+				fmt.Fprintf(o.ErrOut, "Warning: the server doesn't have a resource type '%s'\n", groupResource.Resource)
 			} else {
-				fmt.Fprintf(o.Err, "Warning: the server doesn't have a resource type '%s' in group '%s'\n", groupResource.Resource, groupResource.Group)
+				fmt.Fprintf(o.ErrOut, "Warning: the server doesn't have a resource type '%s' in group '%s'\n", groupResource.Resource, groupResource.Group)
 			}
 			return schema.GroupVersionResource{Resource: resourceArg}
 		}

@@ -23,14 +23,17 @@ import (
 	"crypto/subtle"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/golang/glog"
 
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/authentication/user"
-	"k8s.io/kubernetes/pkg/api"
-	bootstrapapi "k8s.io/kubernetes/pkg/bootstrap/api"
+	bootstrapapi "k8s.io/client-go/tools/bootstrap/token/api"
+	bootstraputil "k8s.io/client-go/tools/bootstrap/token/util"
+	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/client/listers/core/internalversion"
 )
 
@@ -79,6 +82,7 @@ func tokenErrorf(s *api.Secret, format string, i ...interface{}) {
 //       token-id: ( token id )
 //       # Required key usage.
 //       usage-bootstrap-authentication: true
+//       auth-extra-groups: "system:bootstrappers:custom-group1,system:bootstrappers:custom-group2"
 //       # May also contain an expiry.
 //
 // Tokens are expected to be of the form:
@@ -100,6 +104,11 @@ func (t *TokenAuthenticator) AuthenticateToken(token string) (user.Info, bool, e
 			return nil, false, nil
 		}
 		return nil, false, err
+	}
+
+	if secret.DeletionTimestamp != nil {
+		tokenErrorf(secret, "is deleted and awaiting removal")
+		return nil, false, nil
 	}
 
 	if string(secret.Type) != string(bootstrapapi.SecretTypeBootstrapToken) || secret.Data == nil {
@@ -129,34 +138,41 @@ func (t *TokenAuthenticator) AuthenticateToken(token string) (user.Info, bool, e
 		return nil, false, nil
 	}
 
+	groups, err := getGroups(secret)
+	if err != nil {
+		tokenErrorf(secret, "has invalid value for key %s: %v.", bootstrapapi.BootstrapTokenExtraGroupsKey, err)
+		return nil, false, nil
+	}
+
 	return &user.DefaultInfo{
 		Name:   bootstrapapi.BootstrapUserPrefix + string(id),
-		Groups: []string{bootstrapapi.BootstrapGroup},
+		Groups: groups,
 	}, true, nil
 }
 
-// Copied from k8s.io/kubernetes/pkg/bootstrap/api
+// Copied from k8s.io/client-go/tools/bootstrap/token/api
 func getSecretString(secret *api.Secret, key string) string {
-	if secret.Data == nil {
+	data, ok := secret.Data[key]
+	if !ok {
 		return ""
 	}
-	if val, ok := secret.Data[key]; ok {
-		return string(val)
-	}
-	return ""
+
+	return string(data)
 }
 
-// Copied from k8s.io/kubernetes/pkg/bootstrap/api
+// Copied from k8s.io/client-go/tools/bootstrap/token/api
 func isSecretExpired(secret *api.Secret) bool {
 	expiration := getSecretString(secret, bootstrapapi.BootstrapTokenExpirationKey)
 	if len(expiration) > 0 {
 		expTime, err2 := time.Parse(time.RFC3339, expiration)
 		if err2 != nil {
-			tokenErrorf(secret, "has unparsable expiration time (%s). Treating as expired.", expiration)
+			glog.V(3).Infof("Unparseable expiration time (%s) in %s/%s Secret: %v. Treating as expired.",
+				expiration, secret.Namespace, secret.Name, err2)
 			return true
 		}
 		if time.Now().After(expTime) {
-			tokenErrorf(secret, "has expired.", expiration)
+			glog.V(3).Infof("Expired bootstrap token in %s/%s Secret: %v",
+				secret.Namespace, secret.Name, expiration)
 			return true
 		}
 	}
@@ -166,8 +182,10 @@ func isSecretExpired(secret *api.Secret) bool {
 // Copied from kubernetes/cmd/kubeadm/app/util/token
 
 var (
+	// tokenRegexpString defines id.secret regular expression pattern
 	tokenRegexpString = "^([a-z0-9]{6})\\.([a-z0-9]{16})$"
-	tokenRegexp       = regexp.MustCompile(tokenRegexpString)
+	// tokenRegexp is a compiled regular expression of TokenRegexpString
+	tokenRegexp = regexp.MustCompile(tokenRegexpString)
 )
 
 // parseToken tries and parse a valid token from a string.
@@ -178,4 +196,29 @@ func parseToken(s string) (string, string, error) {
 		return "", "", fmt.Errorf("token [%q] was not of form [%q]", s, tokenRegexpString)
 	}
 	return split[1], split[2], nil
+}
+
+// getGroups loads and validates the bootstrapapi.BootstrapTokenExtraGroupsKey
+// key from the bootstrap token secret, returning a list of group names or an
+// error if any of the group names are invalid.
+func getGroups(secret *api.Secret) ([]string, error) {
+	// always include the default group
+	groups := sets.NewString(bootstrapapi.BootstrapDefaultGroup)
+
+	// grab any extra groups and if there are none, return just the default
+	extraGroupsString := getSecretString(secret, bootstrapapi.BootstrapTokenExtraGroupsKey)
+	if extraGroupsString == "" {
+		return groups.List(), nil
+	}
+
+	// validate the names of the extra groups
+	for _, group := range strings.Split(extraGroupsString, ",") {
+		if err := bootstraputil.ValidateBootstrapGroupName(group); err != nil {
+			return nil, err
+		}
+		groups.Insert(group)
+	}
+
+	// return the result as a deduplicated, sorted list
+	return groups.List(), nil
 }

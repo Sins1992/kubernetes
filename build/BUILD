@@ -1,7 +1,7 @@
 package(default_visibility = ["//visibility:public"])
 
-load("@io_bazel//tools/build_defs/docker:docker.bzl", "docker_build")
-load("@io_kubernetes_build//defs:build.bzl", "md5sum", "release_filegroup")
+load("@io_bazel_rules_docker//docker:docker.bzl", "docker_build", "docker_bundle")
+load("@io_kubernetes_build//defs:build.bzl", "release_filegroup")
 
 filegroup(
     name = "package-srcs",
@@ -15,77 +15,86 @@ filegroup(
         ":package-srcs",
         "//build/debs:all-srcs",
         "//build/release-tars:all-srcs",
+        "//build/rpms:all-srcs",
+        "//build/visible_to:all-srcs",
     ],
     tags = ["automanaged"],
 )
 
-docker_build(
-    name = "busybox",
-    debs = [
-        "@busybox_deb//file",
-    ],
-    symlinks = {
-        "/bin/sh": "/bin/busybox",
-        "/usr/bin/busybox": "/bin/busybox",
-        "/usr/sbin/busybox": "/bin/busybox",
-        "/sbin/busybox": "/bin/busybox",
-    },
-)
-
-docker_build(
-    name = "busybox-net",
-    base = ":busybox",
-    debs = [
-        "@libc_deb//file",
-        "@iptables_deb//file",
-        "@iproute2_deb//file",
-        "@libnetlink_deb//file",
-        "@libxtables_deb//file",
-    ],
-)
-
+# This list should roughly match kube::build::get_docker_wrapped_binaries()
+# in build/common.sh.
 DOCKERIZED_BINARIES = {
+    "cloud-controller-manager": {
+        "base": "@official_busybox//image",
+        "target": "//cmd/cloud-controller-manager:cloud-controller-manager",
+    },
     "kube-apiserver": {
-        "base": ":busybox",
+        "base": "@official_busybox//image",
         "target": "//cmd/kube-apiserver:kube-apiserver",
     },
     "kube-controller-manager": {
-        "base": ":busybox",
+        "base": "@official_busybox//image",
         "target": "//cmd/kube-controller-manager:kube-controller-manager",
     },
     "kube-scheduler": {
-        "base": ":busybox",
-        "target": "//plugin/cmd/kube-scheduler:kube-scheduler",
+        "base": "@official_busybox//image",
+        "target": "//cmd/kube-scheduler:kube-scheduler",
     },
     "kube-proxy": {
-        "base": ":busybox-net",
+        "base": "@debian-iptables-amd64//image",
         "target": "//cmd/kube-proxy:kube-proxy",
     },
 }
 
-[md5sum(
-    name = binary + ".docker_tag",
-    src = meta["target"],
-) for binary, meta in DOCKERIZED_BINARIES.items()]
-
 [docker_build(
-    name = binary,
+    name = binary + "-internal",
     base = meta["base"],
     cmd = ["/usr/bin/" + binary],
     debs = [
         "//build/debs:%s.deb" % binary,
     ],
-    image_tags = [
-        "@%s.docker_tag" % binary,
-    ],
-    repository = "gcr.io/google_containers/" + binary,
-    repository_append_package = False,
     symlinks = {
         # Some cluster startup scripts expect to find the binaries in /usr/local/bin,
         # but the debs install the binaries into /usr/bin.
         "/usr/local/bin/" + binary: "/usr/bin/" + binary,
     },
 ) for binary, meta in DOCKERIZED_BINARIES.items()]
+
+[docker_bundle(
+    name = binary,
+    # TODO(thockin): remove the google_containers name after release 1.11.
+    images = {
+        "k8s.gcr.io/%s:{STABLE_DOCKER_TAG}" % binary: binary + "-internal",
+        "gcr.io/google_containers/%s:{STABLE_DOCKER_TAG}" % binary: binary + "-internal",
+    },
+    stamp = True,
+) for binary in DOCKERIZED_BINARIES.keys()]
+
+[genrule(
+    name = binary + "_docker_tag",
+    srcs = [meta["target"]],
+    outs = [binary + ".docker_tag"],
+    cmd = "grep ^STABLE_DOCKER_TAG bazel-out/stable-status.txt | awk '{print $$2}' >$@",
+    stamp = 1,
+) for binary, meta in DOCKERIZED_BINARIES.items()]
+
+genrule(
+    name = "os_package_version",
+    outs = ["version"],
+    cmd = """
+grep ^STABLE_BUILD_SCM_REVISION bazel-out/stable-status.txt \
+    | awk '{print $$2}' \
+    | sed -e 's/^v//' -Ee 's/-([a-z]+)/~\\1/' -e 's/-/+/g' \
+    >$@
+""",
+    stamp = 1,
+)
+
+genrule(
+    name = "cni_package_version",
+    outs = ["cni_version"],
+    cmd = "echo 0.5.1 >$@",
+)
 
 release_filegroup(
     name = "docker-artifacts",
@@ -98,7 +107,6 @@ release_filegroup(
     name = "client-targets",
     srcs = [
         "//cmd/kubectl",
-        "//federation/cmd/kubefed",
     ],
 )
 
@@ -107,6 +115,7 @@ release_filegroup(
     name = "node-targets",
     srcs = [
         "//cmd/kube-proxy",
+        "//cmd/kubeadm",
         "//cmd/kubelet",
     ],
 )
@@ -117,13 +126,12 @@ release_filegroup(
 release_filegroup(
     name = "server-targets",
     srcs = [
+        "//cluster/gce/gci/mounter",
         "//cmd/cloud-controller-manager",
         "//cmd/hyperkube",
         "//cmd/kube-apiserver",
         "//cmd/kube-controller-manager",
-        "//cmd/kubeadm",
-        "//plugin/cmd/kube-scheduler",
-        "//vendor/k8s.io/kube-aggregator",
+        "//cmd/kube-scheduler",
     ],
 )
 
@@ -138,8 +146,6 @@ filegroup(
         "//cmd/genyaml",
         "//cmd/kubemark",  # TODO: server platforms only
         "//cmd/linkcheck",
-        "//cmd/mungedocs",
-        "//federation/cmd/genfeddocs",
         "//test/e2e:e2e.test",
         "//test/e2e_node:e2e_node.test",  # TODO: server platforms only
         "//vendor/github.com/onsi/ginkgo/ginkgo",
@@ -150,9 +156,7 @@ filegroup(
 filegroup(
     name = "test-portable-targets",
     srcs = [
-        "//federation/develop:all-srcs",
         "//hack:e2e.go",
-        "//hack:federated-ginkgo-e2e.sh",
         "//hack:get-build.sh",
         "//hack:ginkgo-e2e.sh",
         "//hack/e2e-internal:all-srcs",

@@ -17,17 +17,16 @@ limitations under the License.
 package storage
 
 import (
-	"time"
-
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
-	"k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
+	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/test/e2e/framework"
+	"k8s.io/kubernetes/test/e2e/storage/utils"
 )
 
 // verifyGCEDiskAttached performs a sanity check to verify the PD attached to the node
@@ -53,7 +52,7 @@ func initializeGCETestSpec(c clientset.Interface, ns string, pvConfig framework.
 }
 
 // Testing configurations of single a PV/PVC pair attached to a GCE PD
-var _ = framework.KubeDescribe("PersistentVolumes:GCEPD [Volume]", func() {
+var _ = utils.SIGDescribe("PersistentVolumes GCEPD", func() {
 	var (
 		c         clientset.Interface
 		diskName  string
@@ -94,11 +93,10 @@ var _ = framework.KubeDescribe("PersistentVolumes:GCEPD [Volume]", func() {
 			},
 			Prebind: nil,
 		}
+		emptyStorageClass := ""
 		pvcConfig = framework.PersistentVolumeClaimConfig{
-			Annotations: map[string]string{
-				v1.BetaStorageClassAnnotation: "",
-			},
-			Selector: selector,
+			Selector:         selector,
+			StorageClassName: &emptyStorageClass,
 		}
 		clientPod, pv, pvc = initializeGCETestSpec(c, ns, pvConfig, pvcConfig, false)
 		node = types.NodeName(clientPod.Spec.NodeName)
@@ -155,7 +153,7 @@ var _ = framework.KubeDescribe("PersistentVolumes:GCEPD [Volume]", func() {
 		err := c.CoreV1().Namespaces().Delete(ns, nil)
 		Expect(err).NotTo(HaveOccurred())
 
-		err = framework.WaitForNamespacesDeleted(c, []string{ns}, 3*time.Minute)
+		err = framework.WaitForNamespacesDeleted(c, []string{ns}, framework.DefaultNamespaceDeletionTimeout)
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Verifying Persistent Disk detaches")

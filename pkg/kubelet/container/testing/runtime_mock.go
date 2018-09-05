@@ -17,14 +17,15 @@ limitations under the License.
 package testing
 
 import (
+	"context"
 	"io"
 	"time"
 
 	"github.com/stretchr/testify/mock"
+	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/util/flowcontrol"
-	"k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/client/unversioned/remotecommand"
 	. "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/volume"
 )
@@ -100,7 +101,7 @@ func (r *Mock) AttachContainer(containerID ContainerID, stdin io.Reader, stdout,
 	return args.Error(0)
 }
 
-func (r *Mock) GetContainerLogs(pod *v1.Pod, containerID ContainerID, logOptions *v1.PodLogOptions, stdout, stderr io.Writer) (err error) {
+func (r *Mock) GetContainerLogs(_ context.Context, pod *v1.Pod, containerID ContainerID, logOptions *v1.PodLogOptions, stdout, stderr io.Writer) (err error) {
 	args := r.Called(pod, containerID, logOptions, stdout, stderr)
 	return args.Error(0)
 }
@@ -140,8 +141,8 @@ func (r *Mock) GetPodContainerID(pod *Pod) (ContainerID, error) {
 	return ContainerID{}, args.Error(0)
 }
 
-func (r *Mock) GarbageCollect(gcPolicy ContainerGCPolicy, ready bool) error {
-	args := r.Called(gcPolicy, ready)
+func (r *Mock) GarbageCollect(gcPolicy ContainerGCPolicy, ready bool, evictNonDeletedPods bool) error {
+	args := r.Called(gcPolicy, ready, evictNonDeletedPods)
 	return args.Error(0)
 }
 
